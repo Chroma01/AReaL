@@ -570,13 +570,19 @@ def tensor_container_to(
     if torch.is_tensor(d):
         return d.to(*args, **kwargs)
 
-    if isinstance(d, list) or isinstance(d, tuple):
+    if isinstance(d, list):
         return [tensor_container_to(v, *args, **kwargs) for v in d]
+
+    if isinstance(d, tuple):
+        values = [tensor_container_to(v, *args, **kwargs) for v in d]
+        if hasattr(d, "_fields"):
+            return type(d)(*values)
+        return tuple(values)
 
     if isinstance(d, dict):
         new_dict = {}
         for key, value in d.items():
-            if isinstance(value, dict) or isinstance(value, list):
+            if isinstance(value, (dict, list, tuple)):
                 new_dict[key] = tensor_container_to(value, *args, **kwargs)
             elif torch.is_tensor(value):
                 new_dict[key] = value.to(*args, **kwargs)
@@ -603,6 +609,35 @@ class MicroBatchItem(NamedTuple):
     padding_length: int
     old_cu_seqlens: torch.Tensor | None
     padded_to_length: int | None = None
+
+    def to(
+        self,
+        *args,
+        **kwargs,
+    ) -> "MicroBatchItem":
+        """Return a device-local copy without mutating the CPU source item.
+
+        Tree batches intentionally alias ``orig_mb`` and ``padded_mb``;
+        preserve that alias so the input is not duplicated on the accelerator.
+        """
+        padded_mb = tensor_container_to(self.padded_mb, *args, **kwargs)
+        orig_mb = (
+            padded_mb
+            if self.orig_mb is self.padded_mb
+            else tensor_container_to(self.orig_mb, *args, **kwargs)
+        )
+        old_cu_seqlens = (
+            self.old_cu_seqlens.to(*args, **kwargs)
+            if self.old_cu_seqlens is not None
+            else None
+        )
+        return MicroBatchItem(
+            orig_mb=orig_mb,
+            padded_mb=padded_mb,
+            padding_length=self.padding_length,
+            old_cu_seqlens=old_cu_seqlens,
+            padded_to_length=self.padded_to_length,
+        )
 
 
 @dataclass
@@ -1306,6 +1341,15 @@ def broadcast_tensor_container(data, src_rank=0, group=None):
                 broadcast_tensor_container(None, src_rank=src_rank, group=group)
                 for _ in range(length)
             ]
+        elif data_type == "tuple":
+            length, container_type = info
+            values = [
+                broadcast_tensor_container(None, src_rank=src_rank, group=group)
+                for _ in range(length)
+            ]
+            if container_type is not None:
+                return container_type(*values)
+            return tuple(values)
         elif data_type == "dict":
             keys = info
             return {
@@ -1334,6 +1378,17 @@ def broadcast_tensor_container(data, src_rank=0, group=None):
                 broadcast_tensor_container(d, src_rank=src_rank, group=group)
                 for d in data
             ]
+        elif isinstance(data, tuple):
+            container_type = type(data) if hasattr(data, "_fields") else None
+            metadata = [("tuple", (len(data), container_type))]
+            dist.broadcast_object_list(metadata, src=src_rank, group=group)
+            values = [
+                broadcast_tensor_container(d, src_rank=src_rank, group=group)
+                for d in data
+            ]
+            if container_type is not None:
+                return container_type(*values)
+            return tuple(values)
         elif isinstance(data, dict):
             metadata = [("dict", list(data.keys()))]
             dist.broadcast_object_list(metadata, src=src_rank, group=group)
