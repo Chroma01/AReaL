@@ -236,6 +236,7 @@ class InteractionWithTokenLogpReward:
             # reward
             rewards=torch.tensor([float(reward)]),
             original_rewards=torch.tensor([float(original_reward)]),
+            is_truncated=torch.tensor([resp.stop_reason == "length"], dtype=torch.bool),
         )
         if self.mm_token_type_ids is not None or self.multi_modal_input is not None:
             mm_token_type_ids = self.mm_token_type_ids or [0] * resp.input_len
